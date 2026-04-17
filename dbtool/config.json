@@ -1,0 +1,8 @@
+{
+  "host": "192.168.21.131",
+  "port": 3306,
+  "user": "kyjk",
+  "password": "Kyjk123456*",
+  "database": "kyuniformstandard",
+  "target_database": "kyuniformstandard_restore"
+}

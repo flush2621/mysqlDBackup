@@ -1,0 +1,1270 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	cli "github.com/jawher/mow.cli"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// Config 数据库配置结构
+type Config struct {
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	User           string `json:"user"`
+	Password       string `json:"password"`
+	Database       string `json:"database"`
+	TargetDatabase string `json:"target_database"` // 新增：目标数据库名
+}
+
+// BackupConfig 备份配置
+type BackupConfig struct {
+	OutputDir    string
+	OutputFile   string
+	Tables       []string
+	Where        string
+	NoData       bool
+	NoCreateInfo bool
+	SkipComments bool
+}
+
+// RestoreConfig 恢复配置
+type RestoreConfig struct {
+	SQLFile   string
+	BatchSize int
+	Force     bool
+}
+
+// 全局配置
+var dbConfig Config
+
+func main() {
+	app := cli.App("mysql-tool", "MySQL 备份和恢复工具")
+
+	// 全局选项：配置文件路径
+	configFile := app.StringOpt("c config", "config.json", "配置文件路径")
+
+	// 加载配置
+	app.Before = func() {
+		loadConfig(*configFile)
+	}
+
+	// 备份命令
+	app.Command("backup", "备份数据库", func(cmd *cli.Cmd) {
+		outputDir := cmd.StringOpt("o output", "./backups", "输出目录")
+		outputFile := cmd.StringOpt("f file", "", "输出文件名（默认自动生成）")
+		tables := cmd.StringsOpt("t tables", nil, "指定要备份的表（可选，不指定则备份所有）")
+		noData := cmd.BoolOpt("no-data", false, "只导出结构，不导出数据")
+		noCreate := cmd.BoolOpt("no-create-info", false, "不导出CREATE TABLE语句")
+
+		cmd.Action = func() {
+			backupConfig := BackupConfig{
+				OutputDir:    *outputDir,
+				OutputFile:   *outputFile,
+				Tables:       *tables,
+				NoData:       *noData,
+				NoCreateInfo: *noCreate,
+			}
+			backup(backupConfig)
+		}
+	})
+
+	// 恢复命令
+	app.Command("restore", "恢复数据库", func(cmd *cli.Cmd) {
+		sqlFile := cmd.StringArg("FILE", "", "要恢复的SQL文件路径")
+		batchSize := cmd.IntOpt("batch-size", 1000, "批量执行的SQL语句数量")
+		force := cmd.BoolOpt("f force", false, "强制恢复（忽略错误）")
+
+		cmd.Action = func() {
+			if *sqlFile == "" {
+				fmt.Println("错误：请指定要恢复的SQL文件")
+				os.Exit(1)
+			}
+			restoreConfig := RestoreConfig{
+				SQLFile:   *sqlFile,
+				BatchSize: *batchSize,
+				Force:     *force,
+			}
+			restore(restoreConfig)
+		}
+	})
+
+	app.Run(os.Args)
+}
+
+// 加载配置文件
+func loadConfig(configFile string) {
+	data, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		fmt.Printf("读取配置文件失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	err = json.Unmarshal(data, &dbConfig)
+	if err != nil {
+		fmt.Printf("解析配置文件失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 验证配置
+	if dbConfig.Host == "" || dbConfig.User == "" {
+		fmt.Println("配置文件缺少必要字段: host, user")
+		os.Exit(1)
+	}
+
+	if dbConfig.Port == 0 {
+		dbConfig.Port = 3306 // 默认端口
+	}
+}
+
+// 构建MySQL连接字符串
+func buildDSN(database string) string {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/",
+		dbConfig.User,
+		dbConfig.Password,
+		dbConfig.Host,
+		dbConfig.Port,
+	)
+
+	if database != "" {
+		dsn += database
+	}
+
+	dsn += "?charset=utf8mb4&parseTime=True&loc=Local"
+	return dsn
+}
+
+// 备份功能
+func backup(config BackupConfig) {
+	// 创建输出目录
+	if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
+		fmt.Printf("创建输出目录失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 确定输出文件名
+	var outputFilePath string
+	if config.OutputFile != "" {
+		outputFilePath = filepath.Join(config.OutputDir, config.OutputFile)
+	} else {
+		timestamp := time.Now().Format("20060102_150405")
+		dbName := dbConfig.Database
+		if dbName == "" {
+			dbName = "mysql"
+		}
+		outputFilePath = filepath.Join(config.OutputDir, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
+	}
+
+	// 构建mysqldump命令 - 使用你成功的参数组合
+	args := []string{
+		fmt.Sprintf("-u%s", dbConfig.User),
+		fmt.Sprintf("-p%s", dbConfig.Password),
+		"-h", dbConfig.Host,
+		"-P", fmt.Sprintf("%d", dbConfig.Port),
+		"--single-transaction",
+		"--routines",
+		"--triggers",
+		"--no-create-db", // 添加这个参数：不生成CREATE DATABASE语句
+		dbConfig.Database,
+	}
+
+	// 可选：添加其他参数
+	if config.NoData {
+		args = append(args, "--no-data")
+	}
+	if config.NoCreateInfo {
+		args = append(args, "--no-create-info")
+	}
+	if config.SkipComments {
+		args = append(args, "--skip-comments")
+	}
+
+	// 如果指定了表，则替换 --databases 为具体的表
+	if len(config.Tables) > 0 {
+		// 移除 --databases 参数，改为指定具体的表
+		newArgs := []string{}
+		for i := 0; i < len(args); i++ {
+			if args[i] != "--databases" {
+				newArgs = append(newArgs, args[i])
+			} else {
+				i++ // 跳过数据库名
+				continue
+			}
+		}
+		args = newArgs
+		args = append(args, config.Tables...)
+	}
+
+	// 执行mysqldump
+	fmt.Printf("开始备份数据库: %s\n", dbConfig.Database)
+	fmt.Printf("输出文件: %s\n", outputFilePath)
+	fmt.Printf("执行命令: mysqldump %s\n", strings.Join(args, " "))
+
+	// 隐藏密码显示
+	displayArgs := make([]string, len(args))
+	copy(displayArgs, args)
+	for i, arg := range displayArgs {
+		if strings.HasPrefix(arg, "-p") && len(arg) > 2 {
+			displayArgs[i] = "-p***"
+		}
+	}
+	fmt.Printf("实际执行: mysqldump %s\n", strings.Join(displayArgs, " "))
+
+	cmd := exec.Command("mysqldump", args...)
+
+	// 创建输出文件
+	file, err := os.Create(outputFilePath)
+	if err != nil {
+		fmt.Printf("创建输出文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	// 设置输出
+	cmd.Stdout = file
+	cmd.Stderr = os.Stderr
+
+	// 执行命令
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("备份失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 获取文件大小
+	fileInfo, _ := file.Stat()
+	fileSize := float64(fileInfo.Size()) / 1024 / 1024
+
+	fmt.Printf("备份完成！\n")
+	fmt.Printf("文件大小: %.2f MB\n", fileSize)
+	fmt.Printf("保存路径: %s\n", outputFilePath)
+}
+
+// 恢复功能 - 删除重建方式
+func restore(config RestoreConfig) {
+	// 检查SQL文件是否存在
+	if _, err := os.Stat(config.SQLFile); os.IsNotExist(err) {
+		fmt.Printf("SQL文件不存在: %s\n", config.SQLFile)
+		os.Exit(1)
+	}
+
+	// 确定目标数据库名（优先使用配置文件中的 target_database，如果没有则使用原 database）
+	targetDB := dbConfig.TargetDatabase
+	if targetDB == "" {
+		targetDB = dbConfig.Database
+	}
+
+	fmt.Printf("开始恢复数据库\n")
+	fmt.Printf("源文件: %s\n", config.SQLFile)
+	fmt.Printf("目标数据库: %s\n", targetDB)
+	fmt.Printf("目标主机: %s:%d\n", dbConfig.Host, dbConfig.Port)
+
+	// 连接MySQL（不指定具体数据库）
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&parseTime=True&loc=Local",
+		dbConfig.User,
+		dbConfig.Password,
+		dbConfig.Host,
+		dbConfig.Port,
+	)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		fmt.Printf("连接数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	// 测试连接
+	err = db.Ping()
+	if err != nil {
+		fmt.Printf("数据库连接测试失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ 数据库连接成功")
+
+	// 询问确认删除数据库
+	fmt.Printf("⚠️  警告：即将删除数据库 '%s' 并重建！\n", targetDB)
+	fmt.Print("确认继续？(y/n): ")
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		fmt.Println("操作已取消")
+		os.Exit(0)
+	}
+
+	// 删除数据库（如果存在）
+	fmt.Printf("🗑️  删除数据库: %s\n", targetDB)
+	dropDBSQL := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", targetDB)
+	_, err = db.Exec(dropDBSQL)
+	if err != nil {
+		fmt.Printf("删除数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ 数据库已删除")
+
+	// 创建数据库（使用 utf8mb4_bin 以区分大小写）
+	fmt.Printf("📦 创建数据库: %s\n", targetDB)
+	createDBSQL := fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", targetDB)
+	_, err = db.Exec(createDBSQL)
+	if err != nil {
+		// 如果 utf8mb4_bin 失败，回退到 utf8mb4_unicode_ci
+		fmt.Println("   ⚠️  utf8mb4_bin 失败，尝试 utf8mb4_unicode_ci...")
+		createDBSQL = fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetDB)
+		_, err = db.Exec(createDBSQL)
+		if err != nil {
+			fmt.Printf("创建数据库失败: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	fmt.Printf("✅ 数据库 %s 已创建\n", targetDB)
+
+	// 选择数据库
+	_, err = db.Exec(fmt.Sprintf("USE `%s`", targetDB))
+	if err != nil {
+		fmt.Printf("选择数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 执行SQL恢复（支持视图）
+	fmt.Println("\n📥 开始导入数据（包括表、视图、存储过程等）...")
+	err = executeSQLFileToTarget(db, config)
+	if err != nil {
+		fmt.Printf("导入失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 验证导入结果
+	verifyImportResult(db, targetDB)
+
+	fmt.Println("\n🎉 恢复完成！")
+}
+
+// 验证导入结果
+func verifyImportResult(db *sql.DB, targetDB string) {
+	fmt.Println("\n🔍 验证导入结果...")
+
+	// 检查表
+	tableRows, err := db.Query("SHOW TABLES")
+	if err == nil {
+		defer tableRows.Close()
+		var tables []string
+		for tableRows.Next() {
+			var table string
+			if err := tableRows.Scan(&table); err == nil {
+				tables = append(tables, table)
+			}
+		}
+		fmt.Printf("   📊 表数量: %d\n", len(tables))
+	}
+
+	// 检查视图
+	viewRows, err := db.Query(`
+		SELECT TABLE_NAME 
+		FROM information_schema.VIEWS 
+		WHERE TABLE_SCHEMA = DATABASE()`)
+	if err == nil {
+		defer viewRows.Close()
+		var views []string
+		for viewRows.Next() {
+			var viewName string
+			if err := viewRows.Scan(&viewName); err == nil {
+				views = append(views, viewName)
+			}
+		}
+		if len(views) > 0 {
+			fmt.Printf("   👁️  视图数量: %d\n", len(views))
+			for _, view := range views {
+				fmt.Printf("      - %s\n", view)
+			}
+		} else {
+			fmt.Println("   👁️  未发现视图")
+		}
+	}
+
+	// 检查存储过程
+	procRows, err := db.Query(`
+		SELECT ROUTINE_NAME 
+		FROM information_schema.ROUTINES 
+		WHERE ROUTINE_SCHEMA = DATABASE() 
+		AND ROUTINE_TYPE = 'PROCEDURE'`)
+	if err == nil {
+		defer procRows.Close()
+		var procs []string
+		for procRows.Next() {
+			var procName string
+			if err := procRows.Scan(&procName); err == nil {
+				procs = append(procs, procName)
+			}
+		}
+		if len(procs) > 0 {
+			fmt.Printf("   🔧 存储过程数量: %d\n", len(procs))
+		}
+	}
+
+	// 检查函数
+	funcRows, err := db.Query(`
+		SELECT ROUTINE_NAME 
+		FROM information_schema.ROUTINES 
+		WHERE ROUTINE_SCHEMA = DATABASE() 
+		AND ROUTINE_TYPE = 'FUNCTION'`)
+	if err == nil {
+		defer funcRows.Close()
+		var funcs []string
+		for funcRows.Next() {
+			var funcName string
+			if err := funcRows.Scan(&funcName); err == nil {
+				funcs = append(funcs, funcName)
+			}
+		}
+		if len(funcs) > 0 {
+			fmt.Printf("   ⚙️  函数数量: %d\n", len(funcs))
+		}
+	}
+}
+
+// 执行SQL文件到目标数据库（支持视图，带详细调试）
+func executeSQLFileToTarget(db *sql.DB, config RestoreConfig) error {
+	// 读取SQL文件
+	content, err := ioutil.ReadFile(config.SQLFile)
+	if err != nil {
+		return fmt.Errorf("读取SQL文件失败: %v", err)
+	}
+
+	// 预处理：将 /*!50001 CREATE VIEW */ 转换为普通 CREATE VIEW
+	sqlContent := string(content)
+
+	// 1. 去掉 /*!xxxxx */
+	sqlContent = unwrapMySQLConditionalComments(sqlContent)
+	sqlContent = removeDefiner(sqlContent)
+	sqlContent = stripDatabasePrefix(sqlContent, "kyuniformstandard1")
+
+	// 2. 合并 VIEW
+	sqlContent = mergeViewStatements(sqlContent)
+
+	// 3. 再走你原有逻辑
+	sqlContent = preprocessSQLContent(sqlContent)
+
+	// 分割SQL语句
+	statements := splitSQLStatementsAdvanced(sqlContent)
+
+	// 过滤空语句和去重
+	var allStatements []string
+	seen := make(map[string]bool)
+
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+
+		// 跳过纯注释行
+		if strings.HasPrefix(stmt, "--") && !strings.Contains(stmt, "CREATE") && !strings.Contains(stmt, "DROP") {
+			continue
+		}
+
+		// 去重
+		normalizedStmt := normalizeStatement(stmt)
+		if seen[normalizedStmt] {
+			continue
+		}
+		seen[normalizedStmt] = true
+
+		allStatements = append(allStatements, stmt)
+	}
+
+	fmt.Printf("📊 共发现 %d 条有效SQL语句（去重后）\n", len(allStatements))
+
+	// 分类语句
+	var dropTableStatements []string
+	var dropViewStatements []string
+	var createTableStatements []string
+	var createViewStatements []string
+	var createTriggerStatements []string
+	var createProcedureStatements []string
+	var createFunctionStatements []string
+	var insertStatements []string
+	var setStatements []string
+	var otherStatements []string
+
+	for _, stmt := range allStatements {
+		upperStmt := strings.ToUpper(strings.TrimSpace(stmt))
+
+		// 跳过 SHOW 语句
+		if strings.HasPrefix(upperStmt, "SHOW ") {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(upperStmt, "DROP TABLE"):
+			dropTableStatements = append(dropTableStatements, stmt)
+		case strings.HasPrefix(upperStmt, "DROP VIEW"):
+			dropViewStatements = append(dropViewStatements, stmt)
+		case strings.HasPrefix(upperStmt, "CREATE TABLE"):
+			createTableStatements = append(createTableStatements, stmt)
+		//case strings.HasPrefix(upperStmt, "CREATE VIEW"):
+		case strings.Contains(upperStmt, "VIEW ") && strings.Contains(upperStmt, " AS "):
+			createViewStatements = append(createViewStatements, stmt)
+		case strings.HasPrefix(upperStmt, "CREATE TRIGGER"):
+			createTriggerStatements = append(createTriggerStatements, stmt)
+		case strings.HasPrefix(upperStmt, "CREATE PROCEDURE"):
+			createProcedureStatements = append(createProcedureStatements, stmt)
+		case strings.HasPrefix(upperStmt, "CREATE FUNCTION"):
+			createFunctionStatements = append(createFunctionStatements, stmt)
+		case strings.HasPrefix(upperStmt, "INSERT INTO"):
+			insertStatements = append(insertStatements, stmt)
+		case strings.HasPrefix(upperStmt, "SET "):
+			if strings.Contains(upperStmt, "FOREIGN_KEY_CHECKS") ||
+				strings.Contains(upperStmt, "SQL_MODE") ||
+				strings.Contains(upperStmt, "CHARACTER_SET") {
+				setStatements = append(setStatements, stmt)
+			}
+		default:
+			if !strings.HasPrefix(upperStmt, "/*!") &&
+				!strings.HasPrefix(upperStmt, "--") &&
+				!strings.HasPrefix(upperStmt, "#") {
+				otherStatements = append(otherStatements, stmt)
+			}
+		}
+	}
+
+	// 去重
+	createTableStatements = deduplicateCreateTableStatements(createTableStatements)
+	createViewStatements = deduplicateCreateViewStatements(createViewStatements)
+
+	fmt.Printf("\n📋 SQL语句分类统计（去重后）:\n")
+	fmt.Printf("   - DROP TABLE: %d 条\n", len(dropTableStatements))
+	fmt.Printf("   - DROP VIEW: %d 条\n", len(dropViewStatements))
+	fmt.Printf("   - CREATE TABLE: %d 条\n", len(createTableStatements))
+	fmt.Printf("   - CREATE VIEW: %d 条\n", len(createViewStatements))
+	fmt.Printf("   - CREATE TRIGGER: %d 条\n", len(createTriggerStatements))
+	fmt.Printf("   - CREATE PROCEDURE: %d 条\n", len(createProcedureStatements))
+	fmt.Printf("   - CREATE FUNCTION: %d 条\n", len(createFunctionStatements))
+	fmt.Printf("   - INSERT: %d 条\n", len(insertStatements))
+	fmt.Printf("   - SET: %d 条\n", len(setStatements))
+	fmt.Printf("   - 其他: %d 条\n", len(otherStatements))
+
+	// 显示前5个视图名称
+	if len(createViewStatements) > 0 {
+		fmt.Printf("\n📋 待创建的视图列表（前5个）:\n")
+		for i, stmt := range createViewStatements {
+			if i >= 5 {
+				break
+			}
+			viewName := extractViewNameFromSQL(stmt)
+			fmt.Printf("   - %s\n", viewName)
+		}
+	}
+
+	// 先执行 SET 语句
+	if len(setStatements) > 0 {
+		fmt.Printf("\n📌 执行: SET 语句 (%d 条)\n", len(setStatements))
+		for _, stmt := range setStatements {
+			if _, err := db.Exec(stmt); err != nil {
+				fmt.Printf("   ⚠️  执行 SET 失败: %v\n", err)
+			}
+		}
+	}
+	sortedViews := sortViewsByDependency(createViewStatements)
+	// 按正确顺序执行
+	orderedGroups := []struct {
+		name        string
+		statements  []string
+		skipOnError bool
+	}{
+		{"删除视图", dropViewStatements, true},
+		{"删除表", dropTableStatements, true},
+		{"创建表", createTableStatements, false},
+		{"插入数据", insertStatements, false},
+		{"创建视图", sortedViews, false}, // ✅ 用排序后的
+		{"创建触发器", createTriggerStatements, false},
+		{"创建存储过程/函数", append(createProcedureStatements, createFunctionStatements...), false},
+		{"其他操作", otherStatements, true},
+	}
+
+	totalSuccess := 0
+	totalError := 0
+
+	// 逐组执行
+	for _, group := range orderedGroups {
+		if len(group.statements) == 0 {
+			continue
+		}
+
+		fmt.Printf("\n📌 执行: %s (%d 条语句)\n", group.name, len(group.statements))
+
+		groupSuccess := 0
+		groupError := 0
+
+		for i, stmt := range group.statements {
+			// 执行前打印（调试用）
+			if group.name == "创建视图" && i < 3 {
+				fmt.Printf("   执行视图SQL: %s\n", truncateString(stmt, 100))
+			}
+
+			// 执行SQL语句
+			_, err := db.Exec(stmt)
+			if err != nil {
+				groupError++
+				totalError++
+
+				// 如果是可跳过的错误
+				if group.skipOnError && strings.Contains(err.Error(), "Unknown table") {
+					fmt.Printf("   ⚠️  跳过: 表/视图不存在\n")
+					continue
+				}
+
+				errMsg := fmt.Sprintf("   ❌ 执行失败: %v\n      SQL: %s\n", err, truncateString(stmt, 200))
+
+				// 视图失败时给出详细提示
+				if group.name == "创建视图" {
+					viewName := extractViewNameFromSQL(stmt)
+					errMsg += fmt.Sprintf("      💡 视图 '%s' 创建失败\n", viewName)
+					errMsg += "      可能原因：\n"
+					errMsg += "        1. 视图依赖的表不存在\n"
+					errMsg += "        2. 视图引用的字段不存在\n"
+					errMsg += "        3. 权限不足\n"
+				}
+
+				if config.Force {
+					fmt.Printf("%s", errMsg)
+					continue
+				} else {
+					return fmt.Errorf(errMsg)
+				}
+			} else {
+				groupSuccess++
+				totalSuccess++
+				if group.name == "创建视图" {
+					viewName := extractViewNameFromSQL(stmt)
+					fmt.Printf("   ✅ 视图 '%s' 创建成功\n", viewName)
+				}
+				// 显示进度
+				if (i+1)%50 == 0 || (i+1) == len(group.statements) {
+					fmt.Printf("   进度: %d/%d (✅成功: %d, ❌失败: %d)\n",
+						i+1, len(group.statements), groupSuccess, groupError)
+				}
+			}
+		}
+
+		fmt.Printf("   ✅ %s完成: 成功 %d, 失败 %d\n", group.name, groupSuccess, groupError)
+	}
+
+	fmt.Printf("\n🎉 执行完成 - 总计成功: %d, 失败: %d\n", totalSuccess, totalError)
+
+	if totalError > 0 && !config.Force {
+		return fmt.Errorf("有 %d 条语句执行失败", totalError)
+	}
+
+	return nil
+}
+
+func sortViewsByDependency(viewSQLs []string) []string {
+	graph := make(map[string][]string)
+	inDegree := make(map[string]int)
+	viewMap := make(map[string]string)
+
+	// 初始化
+	for _, sql := range viewSQLs {
+		name := extractViewName(sql)
+		if name == "" {
+			continue
+		}
+		viewMap[name] = sql
+		inDegree[name] = 0
+	}
+
+	// 建图
+	for _, sql := range viewSQLs {
+		name := extractViewName(sql)
+		if name == "" {
+			continue
+		}
+
+		deps := extractDependencies(sql)
+
+		for _, dep := range deps {
+			// 只关心 view 之间依赖
+			if _, exists := viewMap[dep]; exists {
+				graph[dep] = append(graph[dep], name)
+				inDegree[name]++
+			}
+		}
+	}
+
+	// 拓扑排序（Kahn）
+	var queue []string
+	for k, v := range inDegree {
+		if v == 0 {
+			queue = append(queue, k)
+		}
+	}
+
+	var result []string
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		result = append(result, viewMap[cur])
+
+		for _, next := range graph[cur] {
+			inDegree[next]--
+			if inDegree[next] == 0 {
+				queue = append(queue, next)
+			}
+		}
+	}
+
+	// ⚠️ 检测循环依赖
+	if len(result) != len(viewMap) {
+		fmt.Println("⚠️ 检测到循环依赖，部分视图无法排序，将追加执行")
+		for name, sql := range viewMap {
+			found := false
+			for _, r := range result {
+				if strings.Contains(strings.ToLower(r), name) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result = append(result, sql)
+			}
+		}
+	}
+
+	return result
+}
+
+func extractDependencies(sql string) []string {
+	sqlUpper := strings.ToUpper(sql)
+
+	// 提取 FROM / JOIN 后的表或视图
+	re := regexp.MustCompile(`(?i)(FROM|JOIN)\s+` + "`?" + `([a-zA-Z0-9_]+)` + "`?")
+	matches := re.FindAllStringSubmatch(sqlUpper, -1)
+
+	deps := make(map[string]bool)
+
+	for _, m := range matches {
+		if len(m) > 2 {
+			deps[strings.ToLower(m[2])] = true
+		}
+	}
+
+	var result []string
+	for k := range deps {
+		result = append(result, k)
+	}
+	return result
+}
+
+func extractViewName(stmt string) string {
+	re := regexp.MustCompile("(?i)VIEW\\s+`?([^`\\s]+)`?")
+	m := re.FindStringSubmatch(stmt)
+	if len(m) > 1 {
+		return strings.ToLower(m[1])
+	}
+	return ""
+}
+
+func stripDatabasePrefix(sql string, dbName string) string {
+
+	// ✅ 1. 只处理 `db`.`table`
+	re1 := regexp.MustCompile("`" + dbName + "`\\.`")
+	sql = re1.ReplaceAllString(sql, "`")
+
+	// ❗2. 只处理 FROM/JOIN 后面的 db.table（关键）
+	re2 := regexp.MustCompile(`(?i)\b(FROM|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN)\s+` + dbName + `\.`)
+
+	sql = re2.ReplaceAllString(sql, "${1} ")
+
+	return sql
+}
+
+// 去重 CREATE TABLE 语句
+func deduplicateCreateTableStatements(statements []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, stmt := range statements {
+		// 提取表名
+		tableName := extractTableNameFromCreate(stmt)
+		if tableName != "" && !seen[tableName] {
+			seen[tableName] = true
+			result = append(result, stmt)
+		}
+	}
+
+	return result
+}
+
+// 去重 CREATE VIEW 语句
+func deduplicateCreateViewStatements(statements []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, stmt := range statements {
+		// 提取视图名
+		viewName := extractViewNameFromSQL(stmt)
+		if viewName != "" && !seen[viewName] {
+			seen[viewName] = true
+			result = append(result, stmt)
+		}
+	}
+
+	return result
+}
+
+// 从 CREATE TABLE 语句中提取表名
+func extractTableNameFromCreate(stmt string) string {
+	upperStmt := strings.ToUpper(stmt)
+	idx := strings.Index(upperStmt, "CREATE TABLE")
+	if idx == -1 {
+		return ""
+	}
+
+	remaining := stmt[idx+12:] // 跳过 "CREATE TABLE"
+	remaining = strings.TrimSpace(remaining)
+
+	// 如果以反引号开头
+	if strings.HasPrefix(remaining, "`") {
+		end := strings.Index(remaining[1:], "`")
+		if end > 0 {
+			return remaining[1 : end+1]
+		}
+	} else {
+		// 找到第一个空格、换行或(
+		for i, ch := range remaining {
+			if ch == ' ' || ch == '\n' || ch == '\t' || ch == '(' {
+				return remaining[:i]
+			}
+		}
+	}
+
+	return ""
+}
+
+// 标准化语句用于去重
+func normalizeStatement(stmt string) string {
+	// 移除多余的空格
+	stmt = strings.Join(strings.Fields(stmt), " ")
+	// 转大写进行比较
+	return strings.ToUpper(stmt)
+}
+
+// 预处理SQL内容（改进版，支持 VIEW 和 CREATE VIEW）
+func preprocessSQLContent(sqlContent string) string {
+	lines := strings.Split(sqlContent, "\n")
+	var processedLines []string
+	seenViews := make(map[string]bool)
+	inTemporaryTable := false
+
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+
+		// 检测临时表结构的开始
+		if strings.Contains(line, "Temporary table structure for view") {
+			inTemporaryTable = true
+			continue
+		}
+
+		// 跳过临时表结构的内容
+		if inTemporaryTable {
+			if strings.Contains(line, "CREATE TABLE") {
+				continue
+			}
+			if strings.Contains(line, ");") {
+				inTemporaryTable = false
+			}
+			continue
+		}
+
+		// 处理 /*!50001 VIEW ... */ 格式（无CREATE关键字）
+		if strings.Contains(line, "/*!50001 VIEW") {
+			viewSQL := extractCompleteViewDefinition2(lines, &i, "VIEW")
+			if viewSQL != "" {
+				viewName := extractViewNameFromSQL(viewSQL)
+				if viewName != "" && !seenViews[viewName] {
+					seenViews[viewName] = true
+					// 转换为标准的 CREATE VIEW 语句
+					standardView := convertToStandardCreateView(viewSQL)
+					processedLines = append(processedLines, standardView+";")
+					fmt.Printf("   📝 提取视图: %s\n", viewName)
+				}
+			}
+			continue
+		}
+
+		// 处理 /*!50001 CREATE VIEW */ 格式
+		if strings.Contains(line, "/*!50001 CREATE VIEW") {
+			viewSQL := extractCompleteViewDefinition2(lines, &i, "CREATE VIEW")
+			if viewSQL != "" {
+				viewName := extractViewNameFromSQL(viewSQL)
+				if viewName != "" && !seenViews[viewName] {
+					seenViews[viewName] = true
+					processedLines = append(processedLines, viewSQL+";")
+					fmt.Printf("   📝 提取视图: %s\n", viewName)
+				}
+			}
+			continue
+		}
+
+		// 处理 /*!50001 DROP VIEW */ 格式
+		if strings.Contains(line, "/*!50001 DROP VIEW") {
+			viewSQL := extractDropView(lines, &i)
+			if viewSQL != "" {
+				processedLines = append(processedLines, viewSQL+";")
+			}
+			continue
+		}
+
+		// 普通行
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine != "" &&
+			!strings.HasPrefix(trimmedLine, "--") &&
+			!strings.HasPrefix(trimmedLine, "#") &&
+			!strings.Contains(trimmedLine, "SET character_set_client") &&
+			!strings.Contains(trimmedLine, "SET @saved_cs_client") &&
+			!strings.Contains(trimmedLine, "SET @saved_cs_client") {
+			processedLines = append(processedLines, line)
+		}
+	}
+
+	return strings.Join(processedLines, "\n")
+}
+
+// 提取完整的视图定义（新版，支持指针索引）
+func extractCompleteViewDefinition2(lines []string, index *int, viewType string) string {
+	currentLine := lines[*index]
+
+	// 找到注释的开始
+	start := strings.Index(currentLine, "/*!50001 ")
+	if start == -1 {
+		return ""
+	}
+
+	// 提取从注释开始到注释结束的内容
+	content := currentLine[start+9:] // 跳过 "/*!50001 "
+
+	// 查找 */ 的位置
+	end := strings.Index(content, "*/")
+
+	if end != -1 {
+		// 视图定义在一行内完成
+		viewSQL := strings.TrimSpace(content[:end])
+		// 移除可能的多余空格
+		viewSQL = strings.TrimPrefix(viewSQL, viewType+" ")
+		if !strings.HasPrefix(strings.ToUpper(viewSQL), viewType) {
+			viewSQL = viewType + " " + viewSQL
+		}
+		return viewSQL
+	}
+
+	// 视图定义跨多行，需要继续查找
+	var viewSQL strings.Builder
+	viewSQL.WriteString(content)
+
+	// 继续查找后续行直到找到 */
+	found := false
+	for i := *index + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.Contains(line, "*/") {
+			// 找到结束
+			endIdx := strings.Index(line, "*/")
+			if endIdx > 0 {
+				viewSQL.WriteString(" " + line[:endIdx])
+			} else {
+				viewSQL.WriteString(" " + line)
+			}
+			*index = i // 更新索引，跳过已处理的行
+			found = true
+			break
+		}
+		viewSQL.WriteString(" " + line)
+		*index = i // 更新索引
+	}
+
+	if found {
+		result := strings.TrimSpace(viewSQL.String())
+		// 移除可能的多余空格
+		result = strings.TrimPrefix(result, viewType+" ")
+		if !strings.HasPrefix(strings.ToUpper(result), viewType) {
+			result = viewType + " " + result
+		}
+		return result
+	}
+
+	return ""
+}
+
+// 提取 DROP VIEW 语句
+func extractDropView(lines []string, index *int) string {
+	currentLine := lines[*index]
+
+	start := strings.Index(currentLine, "/*!50001 ")
+	if start == -1 {
+		return ""
+	}
+
+	content := currentLine[start+9:]
+	end := strings.Index(content, "*/")
+
+	if end != -1 {
+		return strings.TrimSpace(content[:end])
+	}
+
+	// 跨行查找
+	var dropSQL strings.Builder
+	dropSQL.WriteString(content)
+
+	for i := *index + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.Contains(line, "*/") {
+			endIdx := strings.Index(line, "*/")
+			if endIdx > 0 {
+				dropSQL.WriteString(" " + line[:endIdx])
+			}
+			*index = i
+			break
+		}
+		dropSQL.WriteString(" " + line)
+		*index = i
+	}
+
+	return strings.TrimSpace(dropSQL.String())
+}
+
+// 将 /*!50001 VIEW ... */ 转换为标准的 CREATE VIEW 语句
+func convertToStandardCreateView(viewSQL string) string {
+	// 移除可能的多余空格
+	viewSQL = strings.TrimSpace(viewSQL)
+
+	// 如果已经是 CREATE VIEW 格式，直接返回
+	if strings.HasPrefix(strings.ToUpper(viewSQL), "CREATE VIEW") {
+		return viewSQL
+	}
+
+	// 如果是 VIEW 格式，添加 CREATE
+	if strings.HasPrefix(strings.ToUpper(viewSQL), "VIEW") {
+		return "CREATE " + viewSQL
+	}
+
+	// 处理反引号开头的特殊情况（视图名直接跟在后面）
+	// 例如: VIEW `view_name` AS SELECT ...
+	if strings.HasPrefix(viewSQL, "`") {
+		return "CREATE VIEW " + viewSQL
+	}
+
+	return "CREATE VIEW " + viewSQL
+}
+
+func removeDefiner(sql string) string {
+	re := regexp.MustCompile("DEFINER=`[^`]+`@`[^`]+`")
+	return re.ReplaceAllString(sql, "")
+}
+
+// 从SQL语句中提取视图名（改进版）
+func extractViewNameFromSQL(stmt string) string {
+	re := regexp.MustCompile("(?i)VIEW\\s+`?([^`\\s]+)`?")
+	match := re.FindStringSubmatch(stmt)
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+func unwrapMySQLConditionalComments(sql string) string {
+	re := regexp.MustCompile(`/\*!\d+\s+(.*?)\s*\*/`)
+	return re.ReplaceAllString(sql, "$1")
+}
+
+func mergeViewStatements(sql string) string {
+	lines := strings.Split(sql, "\n")
+
+	var result []string
+	var buffer []string
+	inView := false
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// 跳过空行
+		if line == "" {
+			continue
+		}
+
+		upper := strings.ToUpper(line)
+
+		// 开始拼 VIEW（CREATE / DEFINER / VIEW）
+		if strings.HasPrefix(upper, "CREATE ALGORITHM") ||
+			strings.Contains(upper, "DEFINER=") ||
+			strings.HasPrefix(upper, "VIEW ") {
+
+			inView = true
+			buffer = append(buffer, line)
+
+			// 如果这一行已经是 VIEW ... AS ... 结束
+			if strings.Contains(upper, " AS ") {
+				result = append(result, strings.Join(buffer, " "))
+				buffer = nil
+				inView = false
+			}
+			continue
+		}
+
+		// 如果正在拼 VIEW
+		if inView {
+			buffer = append(buffer, line)
+
+			if strings.HasSuffix(line, ";") {
+				result = append(result, strings.Join(buffer, " "))
+				buffer = nil
+				inView = false
+			}
+			continue
+		}
+
+		// 普通 SQL
+		result = append(result, line)
+	}
+
+	return strings.Join(result, "\n")
+}
+
+// 改进的SQL语句分割函数
+func splitSQLStatementsAdvanced(sqlContent string) []string {
+	var statements []string
+	var currentStmt strings.Builder
+	inString := false
+	stringChar := byte(0)
+	inComment := false
+	inMultiLineComment := false
+
+	i := 0
+	for i < len(sqlContent) {
+		ch := sqlContent[i]
+
+		// 处理多行注释开始
+		if !inString && !inMultiLineComment && i+1 < len(sqlContent) && ch == '/' && sqlContent[i+1] == '*' {
+			inMultiLineComment = true
+			i += 2
+			continue
+		}
+
+		// 处理多行注释结束
+		if inMultiLineComment && i+1 < len(sqlContent) && ch == '*' && sqlContent[i+1] == '/' {
+			inMultiLineComment = false
+			i += 2
+			continue
+		}
+
+		// 跳过多行注释内容
+		if inMultiLineComment {
+			i++
+			continue
+		}
+
+		// 处理行注释
+		if !inString && !inComment && ch == '-' && i+1 < len(sqlContent) && sqlContent[i+1] == '-' {
+			// 跳过直到行尾
+			for i < len(sqlContent) && sqlContent[i] != '\n' {
+				i++
+			}
+			continue
+		}
+
+		// 处理字符串
+		if !inComment && (ch == '\'' || ch == '"') {
+			if !inString {
+				inString = true
+				stringChar = ch
+			} else if ch == stringChar {
+				// 检查是否为转义引号
+				if i+1 < len(sqlContent) && sqlContent[i+1] == stringChar {
+					currentStmt.WriteByte(ch)
+					i++
+					currentStmt.WriteByte(ch)
+					i++
+					continue
+				}
+				inString = false
+			}
+			currentStmt.WriteByte(ch)
+			i++
+			continue
+		}
+
+		// 分号分隔符
+		if !inString && ch == ';' {
+			stmt := strings.TrimSpace(currentStmt.String())
+			if stmt != "" {
+				statements = append(statements, stmt)
+			}
+			currentStmt.Reset()
+			i++
+			continue
+		}
+
+		currentStmt.WriteByte(ch)
+		i++
+	}
+
+	// 添加最后一条语句
+	if currentStmt.Len() > 0 {
+		stmt := strings.TrimSpace(currentStmt.String())
+		if stmt != "" {
+			statements = append(statements, stmt)
+		}
+	}
+
+	return statements
+}
+
+// 截断字符串
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// 获取数据库列表（辅助功能）
+func getDatabaseList() ([]string, error) {
+	dsn := buildDSN("")
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			return nil, err
+		}
+		// 跳过系统数据库
+		if dbName != "information_schema" &&
+			dbName != "performance_schema" &&
+			dbName != "mysql" &&
+			dbName != "sys" {
+			databases = append(databases, dbName)
+		}
+	}
+
+	return databases, nil
+}

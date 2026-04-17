@@ -1,0 +1,524 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	cli "github.com/jawher/mow.cli"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// Config 数据库配置结构
+type Config struct {
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	User           string `json:"user"`
+	Password       string `json:"password"`
+	Database       string `json:"database"`
+	TargetDatabase string `json:"target_database"` // 新增：目标数据库名
+}
+
+// BackupConfig 备份配置
+type BackupConfig struct {
+	OutputDir    string
+	OutputFile   string
+	Tables       []string
+	Where        string
+	NoData       bool
+	NoCreateInfo bool
+	SkipComments bool
+}
+
+// RestoreConfig 恢复配置
+type RestoreConfig struct {
+	SQLFile   string
+	BatchSize int
+	Force     bool
+}
+
+// 全局配置
+var dbConfig Config
+
+func main() {
+	app := cli.App("mysql-tool", "MySQL 备份和恢复工具")
+
+	// 全局选项：配置文件路径
+	configFile := app.StringOpt("c config", "config.json", "配置文件路径")
+
+	// 加载配置
+	app.Before = func() {
+		loadConfig(*configFile)
+	}
+
+	// 备份命令
+	app.Command("backup", "备份数据库", func(cmd *cli.Cmd) {
+		outputDir := cmd.StringOpt("o output", "./backups", "输出目录")
+		outputFile := cmd.StringOpt("f file", "", "输出文件名（默认自动生成）")
+		tables := cmd.StringsOpt("t tables", nil, "指定要备份的表（可选，不指定则备份所有）")
+		noData := cmd.BoolOpt("no-data", false, "只导出结构，不导出数据")
+		noCreate := cmd.BoolOpt("no-create-info", false, "不导出CREATE TABLE语句")
+
+		cmd.Action = func() {
+			backupConfig := BackupConfig{
+				OutputDir:    *outputDir,
+				OutputFile:   *outputFile,
+				Tables:       *tables,
+				NoData:       *noData,
+				NoCreateInfo: *noCreate,
+			}
+			backup(backupConfig)
+		}
+	})
+
+	// 恢复命令
+	app.Command("restore", "恢复数据库", func(cmd *cli.Cmd) {
+		sqlFile := cmd.StringArg("FILE", "", "要恢复的SQL文件路径")
+		batchSize := cmd.IntOpt("batch-size", 1000, "批量执行的SQL语句数量")
+		force := cmd.BoolOpt("f force", false, "强制恢复（忽略错误）")
+
+		cmd.Action = func() {
+			if *sqlFile == "" {
+				fmt.Println("错误：请指定要恢复的SQL文件")
+				os.Exit(1)
+			}
+			restoreConfig := RestoreConfig{
+				SQLFile:   *sqlFile,
+				BatchSize: *batchSize,
+				Force:     *force,
+			}
+			restore(restoreConfig)
+		}
+	})
+
+	app.Run(os.Args)
+}
+
+// 加载配置文件
+func loadConfig(configFile string) {
+	data, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		fmt.Printf("读取配置文件失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	err = json.Unmarshal(data, &dbConfig)
+	if err != nil {
+		fmt.Printf("解析配置文件失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 验证配置
+	if dbConfig.Host == "" || dbConfig.User == "" {
+		fmt.Println("配置文件缺少必要字段: host, user")
+		os.Exit(1)
+	}
+
+	if dbConfig.Port == 0 {
+		dbConfig.Port = 3306 // 默认端口
+	}
+}
+
+// 构建MySQL连接字符串
+func buildDSN(database string) string {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/",
+		dbConfig.User,
+		dbConfig.Password,
+		dbConfig.Host,
+		dbConfig.Port,
+	)
+
+	if database != "" {
+		dsn += database
+	}
+
+	dsn += "?charset=utf8mb4&parseTime=True&loc=Local"
+	return dsn
+}
+
+// 备份功能
+// 备份功能 - 修复版（匹配你的成功命令）
+func backup(config BackupConfig) {
+	// 创建输出目录
+	if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
+		fmt.Printf("创建输出目录失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 确定输出文件名
+	var outputFilePath string
+	if config.OutputFile != "" {
+		outputFilePath = filepath.Join(config.OutputDir, config.OutputFile)
+	} else {
+		timestamp := time.Now().Format("20060102_150405")
+		dbName := dbConfig.Database
+		if dbName == "" {
+			dbName = "mysql"
+		}
+		outputFilePath = filepath.Join(config.OutputDir, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
+	}
+
+	// 构建mysqldump命令 - 使用你成功的参数组合
+	args := []string{
+		fmt.Sprintf("-u%s", dbConfig.User),
+		fmt.Sprintf("-p%s", dbConfig.Password),
+		"-h", dbConfig.Host,
+		"-P", fmt.Sprintf("%d", dbConfig.Port),
+		"--single-transaction",
+		"--routines",
+		"--triggers",
+		"--no-create-db", // 添加这个参数：不生成CREATE DATABASE语句
+		dbConfig.Database,
+	}
+
+	// 可选：添加其他参数
+	if config.NoData {
+		args = append(args, "--no-data")
+	}
+	if config.NoCreateInfo {
+		args = append(args, "--no-create-info")
+	}
+	if config.SkipComments {
+		args = append(args, "--skip-comments")
+	}
+
+	// 如果指定了表，则替换 --databases 为具体的表
+	if len(config.Tables) > 0 {
+		// 移除 --databases 参数，改为指定具体的表
+		newArgs := []string{}
+		for i := 0; i < len(args); i++ {
+			if args[i] != "--databases" {
+				newArgs = append(newArgs, args[i])
+			} else {
+				i++ // 跳过数据库名
+				continue
+			}
+		}
+		args = newArgs
+		args = append(args, config.Tables...)
+	}
+
+	// 执行mysqldump
+	fmt.Printf("开始备份数据库: %s\n", dbConfig.Database)
+	fmt.Printf("输出文件: %s\n", outputFilePath)
+	fmt.Printf("执行命令: mysqldump %s\n", strings.Join(args, " "))
+
+	// 隐藏密码显示
+	displayArgs := make([]string, len(args))
+	copy(displayArgs, args)
+	for i, arg := range displayArgs {
+		if strings.HasPrefix(arg, "-p") && len(arg) > 2 {
+			displayArgs[i] = "-p***"
+		}
+	}
+	fmt.Printf("实际执行: mysqldump %s\n", strings.Join(displayArgs, " "))
+
+	cmd := exec.Command("mysqldump", args...)
+
+	// 创建输出文件
+	file, err := os.Create(outputFilePath)
+	if err != nil {
+		fmt.Printf("创建输出文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	// 设置输出
+	cmd.Stdout = file
+	cmd.Stderr = os.Stderr
+
+	// 执行命令
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("备份失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 获取文件大小
+	fileInfo, _ := file.Stat()
+	fileSize := float64(fileInfo.Size()) / 1024 / 1024
+
+	fmt.Printf("备份完成！\n")
+	fmt.Printf("文件大小: %.2f MB\n", fileSize)
+	fmt.Printf("保存路径: %s\n", outputFilePath)
+}
+
+// 恢复功能 - 删除重建方式
+func restore(config RestoreConfig) {
+	// 检查SQL文件是否存在
+	if _, err := os.Stat(config.SQLFile); os.IsNotExist(err) {
+		fmt.Printf("SQL文件不存在: %s\n", config.SQLFile)
+		os.Exit(1)
+	}
+
+	// 确定目标数据库名（优先使用配置文件中的 target_database，如果没有则使用原 database）
+	targetDB := dbConfig.TargetDatabase
+	if targetDB == "" {
+		targetDB = dbConfig.Database
+	}
+
+	fmt.Printf("开始恢复数据库\n")
+	fmt.Printf("源文件: %s\n", config.SQLFile)
+	fmt.Printf("目标数据库: %s\n", targetDB)
+	fmt.Printf("目标主机: %s:%d\n", dbConfig.Host, dbConfig.Port)
+
+	// 连接MySQL（不指定具体数据库）
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&parseTime=True&loc=Local",
+		dbConfig.User,
+		dbConfig.Password,
+		dbConfig.Host,
+		dbConfig.Port,
+	)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		fmt.Printf("连接数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	// 测试连接
+	err = db.Ping()
+	if err != nil {
+		fmt.Printf("数据库连接测试失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ 数据库连接成功")
+
+	// 询问确认删除数据库
+	fmt.Printf("⚠️  警告：即将删除数据库 '%s' 并重建！\n", targetDB)
+	fmt.Print("确认继续？(y/n): ")
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		fmt.Println("操作已取消")
+		os.Exit(0)
+	}
+
+	// 删除数据库（如果存在）
+	fmt.Printf("🗑️  删除数据库: %s\n", targetDB)
+	dropDBSQL := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", targetDB)
+	_, err = db.Exec(dropDBSQL)
+	if err != nil {
+		fmt.Printf("删除数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ 数据库已删除")
+
+	// 创建数据库
+	fmt.Printf("📦 创建数据库: %s\n", targetDB)
+	createDBSQL := fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", targetDB)
+	_, err = db.Exec(createDBSQL)
+	if err != nil {
+		fmt.Printf("创建数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ 数据库 %s 已创建\n", targetDB)
+
+	// 选择数据库
+	_, err = db.Exec(fmt.Sprintf("USE `%s`", targetDB))
+	if err != nil {
+		fmt.Printf("选择数据库失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 执行SQL恢复
+	fmt.Println("\n📥 开始导入数据...")
+	err = executeSQLFileToTarget(db, config)
+	if err != nil {
+		fmt.Printf("导入失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("\n🎉 恢复完成！")
+}
+
+// 执行SQL文件到目标数据库
+func executeSQLFileToTarget(db *sql.DB, config RestoreConfig) error {
+	// 读取SQL文件
+	content, err := ioutil.ReadFile(config.SQLFile)
+	if err != nil {
+		return fmt.Errorf("读取SQL文件失败: %v", err)
+	}
+
+	// 分割SQL语句
+	sqlContent := string(content)
+	statements := splitSQLStatements(sqlContent)
+
+	// 过滤空语句和注释
+	var validStatements []string
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		// 跳过纯注释行
+		if strings.HasPrefix(stmt, "--") || strings.HasPrefix(stmt, "/*") {
+			continue
+		}
+		validStatements = append(validStatements, stmt)
+	}
+
+	totalStatements := len(validStatements)
+	successCount := 0
+	errorCount := 0
+
+	fmt.Printf("📊 共发现 %d 条有效SQL语句\n", totalStatements)
+
+	// 批量执行（不使用事务，避免大事务问题）
+	for i, stmt := range validStatements {
+		// 执行SQL语句
+		_, err := db.Exec(stmt)
+		if err != nil {
+			errorCount++
+			errMsg := fmt.Sprintf("执行第 %d 条语句失败: %v\nSQL: %s\n", i+1, err, truncateString(stmt, 200))
+
+			if config.Force {
+				fmt.Printf("⚠️  警告: %s\n", errMsg)
+				continue
+			} else {
+				return fmt.Errorf(errMsg)
+			}
+		} else {
+			successCount++
+			// 显示进度
+			if (i+1)%config.BatchSize == 0 || (i+1) == totalStatements {
+				fmt.Printf("📈 进度: %d/%d (✅成功: %d, ❌失败: %d)\n",
+					i+1, totalStatements, successCount, errorCount)
+			}
+		}
+	}
+
+	fmt.Printf("\n✅ 执行完成 - 成功: %d, 失败: %d, 总计: %d\n",
+		successCount, errorCount, totalStatements)
+
+	if errorCount > 0 && !config.Force {
+		return fmt.Errorf("有 %d 条语句执行失败", errorCount)
+	}
+
+	return nil
+}
+
+// 分割SQL语句（处理多行语句和DELIMITER）
+func splitSQLStatements(sqlContent string) []string {
+	statements := []string{}
+	var currentStmt strings.Builder
+	inString := false
+	stringChar := byte(0)
+	inComment := false
+
+	for i := 0; i < len(sqlContent); i++ {
+		ch := sqlContent[i]
+
+		// 处理字符串
+		if !inComment && (ch == '\'' || ch == '"') {
+			if !inString {
+				inString = true
+				stringChar = ch
+			} else if ch == stringChar {
+				// 检查是否为转义引号
+				if i+1 < len(sqlContent) && sqlContent[i+1] == stringChar {
+					currentStmt.WriteByte(ch)
+					i++ // 跳过下一个引号
+					currentStmt.WriteByte(ch)
+					continue
+				}
+				inString = false
+			}
+			currentStmt.WriteByte(ch)
+			continue
+		}
+
+		// 处理注释
+		if !inString && !inComment {
+			if ch == '-' && i+1 < len(sqlContent) && sqlContent[i+1] == '-' {
+				inComment = true
+				continue
+			}
+			if ch == '/' && i+1 < len(sqlContent) && sqlContent[i+1] == '*' {
+				inComment = true
+				i++ // 跳过 *
+				continue
+			}
+		}
+
+		if inComment {
+			if ch == '\n' && i > 0 && sqlContent[i-1] == '-' {
+				inComment = false
+			}
+			if ch == '/' && i > 0 && sqlContent[i-1] == '*' {
+				inComment = false
+			}
+			continue
+		}
+
+		// 分号分隔符
+		if !inString && ch == ';' {
+			stmt := strings.TrimSpace(currentStmt.String())
+			if stmt != "" {
+				statements = append(statements, stmt)
+			}
+			currentStmt.Reset()
+			continue
+		}
+
+		currentStmt.WriteByte(ch)
+	}
+
+	// 添加最后一条语句
+	if currentStmt.Len() > 0 {
+		stmt := strings.TrimSpace(currentStmt.String())
+		if stmt != "" {
+			statements = append(statements, stmt)
+		}
+	}
+
+	return statements
+}
+
+// 截断字符串
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// 获取数据库列表（辅助功能）
+func getDatabaseList() ([]string, error) {
+	dsn := buildDSN("")
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			return nil, err
+		}
+		// 跳过系统数据库
+		if dbName != "information_schema" &&
+			dbName != "performance_schema" &&
+			dbName != "mysql" &&
+			dbName != "sys" {
+			databases = append(databases, dbName)
+		}
+	}
+
+	return databases, nil
+}
